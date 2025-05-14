@@ -1,3 +1,4 @@
+# dts/bindings/zmk,analog-input.yaml
 description: |
   Input driver for ADC io channel with support for scan mode
 
@@ -24,8 +25,8 @@ properties:
     description: |
       List of ADC channel IDs to scan when in scan mode. Each entry
       corresponds to a channel in the order they will be sampled.
-    items:
-      type: int
+    schema:  # 改为 schema 而非 items
+      type: int  # 每个元素的类型
     required: false
 
 child-binding:
