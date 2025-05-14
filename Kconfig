@@ -1,0 +1,28 @@
+config ANALOG_INPUT
+    bool "Analog Input Driver"
+    depends on ADC
+    default y
+    help
+      Driver for analog input devices such as thumbsticks.
+
+config ANALOG_INPUT_SCAN_MODE
+    bool "Enable ADC scan mode"
+    depends on ANALOG_INPUT
+    default n
+    help
+      Enable ADC scan mode for reading multiple channels in one go.
+      This is more efficient but requires hardware support.
+
+config ANALOG_INPUT_LOG_DBG_RAW
+    bool "Enable logging of raw and pre-processed values"
+    depends on ANALOG_INPUT && LOG
+    default n
+    help
+      Enable detailed logging of raw ADC values and pre-processed values.
+
+config ANALOG_INPUT_LOG_DBG_REPORT
+    bool "Enable logging of reported values"
+    depends on ANALOG_INPUT && LOG
+    default n
+    help
+      Enable detailed logging of values sent to the input subsystem.
