@@ -1,32 +1,24 @@
-# dts/bindings/zmk,analog-input.yaml
+# Copyright (c) 2022 The ZMK Contributors
+# SPDX-License-Identifier: MIT
 description: |
-  Input driver for ADC io channel with support for scan mode
+  Input driver for ADC io channel with scan mode support
 
 compatible: "zmk,analog-input"
-
-include: [base.yaml]
 
 properties:
   sampling-hz:
     type: int
-    required: true
-    description: Sampling frequency in Hz
-    
-  mode:
-    type: string
-    enum: ["single", "scan"]
-    description: |
-      Operating mode of the ADC. "single" mode reads channels one by one,
-      while "scan" mode uses hardware scanning to read multiple channels.
-    default: "single"
-    
-  scan-sequence:
+    default: 100
+  
+  scan-mode:
+    type: boolean
+    description: Enable ADC scan mode for reading multiple channels
+    default: false
+  
+  scan-channels:
     type: array
-    description: |
-      List of ADC channel IDs to scan when in scan mode. Each entry
-      corresponds to a channel in the order they will be sampled.
-    schema:  # 改为 schema 而非 items
-      type: int  # 每个元素的类型
+    description: List of ADC channel IDs to scan (when scan-mode is enabled)
+    default: []
     required: false
 
 child-binding:
