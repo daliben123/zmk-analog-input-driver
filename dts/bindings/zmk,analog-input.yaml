@@ -12,13 +12,16 @@ properties:
   
   scan-mode:
     type: boolean
-    description: Enable ADC scan mode for reading multiple channels
-    default: false
+    description: |
+      Enable ADC scan mode for reading multiple channels.
+      Presence of this property enables scan mode.
+    required: false  # 设为可选属性，不存在时默认为 false
   
   scan-channels:
     type: array
-    description: List of ADC channel IDs to scan (when scan-mode is enabled)
-    default: []
+    description: |
+      List of ADC channel IDs to scan (when scan-mode is enabled).
+      Each entry corresponds to a channel in the order they will be sampled.
     required: false
 
 child-binding:
