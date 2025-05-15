@@ -1,3 +1,10 @@
+
+/*
+ * Copyright (c) 2019 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
 #ifndef ZEPHYR_INCLUDE_ANALOG_INPUT_H_
 #define ZEPHYR_INCLUDE_ANALOG_INPUT_H_
 
@@ -8,25 +15,44 @@
  */
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/adc.h>
-#include <zephyr/drivers/input.h>
+#include <zephyr/drivers/sensor.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** Maximum number of supported ADC channels */
-#define ANALOG_INPUT_MAX_CHANNELS 8
+struct analog_input_data {
+    const struct device *dev;
+    struct adc_sequence as;
+#if CONFIG_ADC_ASYNC
+    struct k_poll_signal async_sig;
+    struct k_poll_event async_evt;
+#endif
+    uint16_t *as_buff;
+    int32_t *delta;
+    int32_t *prev;
+    struct k_work_delayable init_work;
+    int async_init_step;
+    bool ready;
 
-/** Analog input operating modes */
-enum analog_input_mode {
-    ANALOG_INPUT_MODE_SINGLE, /**< Single channel mode */
-    ANALOG_INPUT_MODE_SCAN,   /**< Scan mode */
+    uint32_t sampling_hz;
+    bool enabled;
+    bool actived;
+
+    struct k_work sampling_work;
+    struct k_timer sampling_timer;
+    int err;
+
+    uint8_t error_count;              // エラーカウント
+    uint32_t last_successful_read;    // 最後に成功した読み取りの時刻
+    struct k_work_delayable watchdog_work;  // Watchdog用のwork item
 };
 
-/** Configuration for each ADC channel */
-struct analog_input_io_channel {
-    struct adc_dt_spec adc_channel;
+struct analog_input_io_channel { 
+	struct adc_dt_spec adc_channel;
     uint16_t mv_mid;
     uint16_t mv_min_max;
     uint8_t mv_deadzone;
@@ -38,35 +64,38 @@ struct analog_input_io_channel {
     uint8_t input_code;
 };
 
-/** Analog input driver configuration */
 struct analog_input_config {
     uint32_t sampling_hz;
-    enum analog_input_mode mode;
     uint8_t io_channels_len;
-    struct analog_input_io_channel io_channels[];
-    uint8_t scan_sequence[ANALOG_INPUT_MAX_CHANNELS];
-    uint8_t scan_sequence_len;
+	struct analog_input_io_channel io_channels[];
 };
 
-/** Analog input driver runtime data */
-struct analog_input_data {
-    const struct device *dev;
-    struct adc_sequence as;
-    uint16_t *as_buff;
-    int32_t *delta;
-    int32_t *prev;
-    struct k_work_delayable init_work;
-    bool ready;
+/* Helper macros used to convert sensor values. */
+#define ANALOG_INPUT_SVALUE_TO_SAMPLING_HZ(svalue) ((uint32_t)(svalue).val1)
+#define ANALOG_INPUT_SVALUE_TO_ENABLE(svalue) ((uint32_t)(svalue).val1)
+#define ANALOG_INPUT_SVALUE_TO_ACTIVE(svalue) ((uint32_t)(svalue).val1)
 
-    uint32_t sampling_hz;
-    bool enabled;
+/** @brief Sensor specific attributes of ANALOG_INPUT. */
+enum analog_input_attribute {
 
-    struct k_work sampling_work;
-    struct k_timer sampling_timer;
+    // setup polling timer
+    ANALOG_INPUT_ATTR_SAMPLING_HZ,
+
+    // ENABLE sampling timer
+	ANALOG_INPUT_ATTR_ENABLE,
+
+    // ACTIVE input reporting
+    // or else, manually call sample_fetch & channel_get via sensor api.
+	ANALOG_INPUT_ATTR_ACTIVE,
+
 };
 
 #ifdef __cplusplus
 }
 #endif
+
+/**
+ * @}
+ */
 
 #endif /* ZEPHYR_INCLUDE_ANALOG_INPUT_H_ */
