@@ -1,3 +1,6 @@
-cmake_minimum_required(VERSION 3.20.0)
+zephyr_library()
 
-set(ZEPHYR_EXTRA_MODULES ${CMAKE_CURRENT_SOURCE_DIR})
+zephyr_library_sources_ifdef(CONFIG_ANALOG_INPUT src/analog_input.c)
+zephyr_include_directories(include)
+
+zephyr_include_directories(${APPLICATION_SOURCE_DIR}/include)
