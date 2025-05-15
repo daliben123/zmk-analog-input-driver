@@ -1,313 +1,563 @@
-#include <zephyr/device.h>
-#include <zephyr/drivers/adc.h>
-#include <zephyr/drivers/input.h>
-#include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
 
-#include "analog_input.h"
-
-LOG_MODULE_REGISTER(analog_input, CONFIG_ANALOG_INPUT_LOG_LEVEL);
-
-static void sampling_timer_handler(struct k_timer *timer);
-static void sampling_work_handler(struct k_work *work);
-static void analog_input_async_init(struct k_work *work);
-static int analog_input_report_data(const struct device *dev);
-static void process_channel_data(const struct device *dev, uint8_t ch_idx, int32_t raw);
-
-/**
- * @brief Initialize the analog input driver asynchronously
+/*
+ * Copyright (c) 2022 The ZMK Contributors
+ *
+ * SPDX-License-Identifier: MIT
  */
+
+#define DT_DRV_COMPAT zmk_analog_input
+
+#include <zephyr/kernel.h>
+#include <zephyr/sys/byteorder.h>
+#include <zephyr/input/input.h>
+#include <zmk/keymap.h>
+#include <stdlib.h> //for abs()
+#include <zephyr/sys/util.h> // for CLAMP
+
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
+
+#include <zmk/drivers/analog_input.h>
+
+static int analog_input_report_data(const struct device *dev) {
+    struct analog_input_data *data = dev->data;
+    const struct analog_input_config *config = dev->config;
+
+    if (unlikely(!data->ready)) {
+        LOG_WRN("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+#if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
+    static int64_t last_smp_time = 0;
+    static int64_t last_rpt_time = 0;
+    int64_t now = k_uptime_get();
+#endif
+
+    struct adc_sequence* as = &data->as;
+
+    for (uint8_t i = 0; i < config->io_channels_len; i++) {
+        struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
+        const struct device* adc = ch_cfg.adc_channel.dev;
+
+        if (i == 0) {
+#ifdef CONFIG_ADC_ASYNC
+            int err = adc_read_async(adc, as, &data->async_sig);
+            if (err < 0) {
+                LOG_ERR("AIN%u read_async returned %d", i, err);
+                return err;
+            }
+            err = k_poll(&data->async_evt, 1, K_FOREVER);
+            if (err < 0) {
+                LOG_ERR("AIN%u k_poll returned %d", i, err);
+                return err;
+            }
+            if (!data->async_evt.signal->signaled) {
+                return 0;
+            }
+            data->async_evt.signal->signaled = 0;
+    	    data->async_evt.state = K_POLL_STATE_NOT_READY;
+#else
+            int err = adc_read(adc, as);
+            if (err < 0) {
+                LOG_ERR("AIN%u read returned %d", i, err);
+                return err;
+            }
+#endif
+        }
+
+        int32_t raw = data->as_buff[i];
+        int32_t mv = raw;
+        adc_raw_to_millivolts(adc_ref_internal(adc), ADC_GAIN_1_6, as->resolution, &mv);
+#if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)
+        LOG_DBG("AIN%u raw: %d mv: %d", ch_cfg.adc_channel.channel_id, raw, mv);
+#endif
+
+        int16_t v = mv - ch_cfg.mv_mid;
+        int16_t dz = ch_cfg.mv_deadzone;
+        if (dz) {
+            if (v > 0) {
+                if (v < dz) v = 0; else v -= dz;
+            }
+            if (v < 0) {
+                if (v > -dz) v = 0; else v += dz;
+            }
+        }
+        uint16_t mm = ch_cfg.mv_min_max;
+        if (mm) {
+            if (v > 0 && v > mm) v = mm;
+            if (v < 0 && v < -mm) v = -mm;
+        }
+
+        if (ch_cfg.invert) v *= -1;
+        v = (int16_t)((v * ch_cfg.scale_multiplier) / ch_cfg.scale_divisor);
+
+        if (ch_cfg.report_on_change_only) {
+            // track raw value to compare until next report interval
+            data->delta[i] = v;
+        }
+        else {
+            // accumulate delta until report in next iteration
+            int32_t delta = data->delta[i];
+            int32_t dv = delta + v;
+            data->delta[i] = dv;
+        }
+    }
+
+    // First read is setup as calibration
+    as->calibrate = false;
+
+#if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
+    // purge accumulated delta, if last sampled had not been reported on last report tick
+    if (now - last_smp_time >= CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN) {
+        for (uint8_t i = 0; i < config->io_channels_len; i++) {
+            data->delta[i] = 0;
+            data->prev[i] = 0;
+        }
+    }
+    last_smp_time = now;
+#endif
+
+#if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
+    // strict to report inerval
+    if (now - last_rpt_time < CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN) {
+        return 0;
+    }
+#endif
+
+    if (!data->actived) {
+        return 0;
+    }
+
+    int8_t idx_to_sync = -1;
+    for (uint8_t i = config->io_channels_len - 1; i >= 0; i--) {
+        int32_t dv = data->delta[i];
+        int32_t pv = data->prev[i];
+        if (dv != pv) {
+            idx_to_sync = i;
+            break;
+        }
+    }
+
+    for (uint8_t i = 0; i < config->io_channels_len; i++) {
+        struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
+        // LOG_DBG("AIN%u get delta AGAIN", i);
+        int32_t dv = data->delta[i];
+        int32_t pv = data->prev[i];
+        if (dv != pv) {
+#if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
+            last_rpt_time = now;
+#endif
+            data->delta[i] = 0;
+            if (ch_cfg.report_on_change_only) {
+                data->prev[i] = dv;
+            }
+
+#if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_REPORT)
+            LOG_DBG("input_report %u rv: %d  e:%d  c:%d", i, dv, ch_cfg.evt_type, ch_cfg.input_code);
+#endif
+            input_report(dev, ch_cfg.evt_type, ch_cfg.input_code, dv, i == idx_to_sync, K_NO_WAIT);
+        }
+    }
+    return 0;
+}
+
+K_THREAD_STACK_DEFINE(analog_input_q_stack, CONFIG_ANALOG_INPUT_WORKQUEUE_STACK_SIZE);
+
+static struct k_work_q analog_input_work_q;
+
+// analog_input.c の sampling_work_handler を修正
+static void sampling_work_handler(struct k_work *work) {
+    struct analog_input_data *data = CONTAINER_OF(work, struct analog_input_data, sampling_work);
+    int err = analog_input_report_data(data->dev);
+    
+    // エラー検出とリカバリー
+    if (err < 0) {
+        LOG_ERR("Sampling error detected (%d), attempting recovery", err);
+        
+        // エラーカウントを増やす
+        data->error_count++;
+        
+        // 連続エラーが一定回数を超えた場合
+        if (data->error_count > CONFIG_ANALOG_INPUT_ERROR_THRESHOLD) {
+            LOG_WRN("Multiple errors detected, resetting ADC");
+            
+            // ADCをリセット
+            err = reset_adc_sequence(data->dev);
+            if (err < 0) {
+                LOG_ERR("Failed to reset ADC (%d)", err);
+                // サンプリングを一時停止
+                k_timer_stop(&data->sampling_timer);
+                data->enabled = false;
+                return;
+            }
+            
+            // エラーカウントをリセット
+            data->error_count = 0;
+        }
+    } else {
+        // 正常な場合はエラーカウントをリセット
+        data->error_count = 0;
+    }
+}
+
+// analog_input.c に追加
+static void sampling_timer_handler(struct k_timer *timer);
+static void watchdog_work_handler(struct k_work *work) {
+    struct analog_input_data *data = CONTAINER_OF(work, struct analog_input_data, watchdog_work);
+    uint32_t now = k_uptime_get_32();
+    
+    // 最後の成功した読み取りからの経過時間をチェック
+    if ((now - data->last_successful_read) > CONFIG_ANALOG_INPUT_WATCHDOG_TIMEOUT_MS) {
+        LOG_WRN("ADC appears to be stuck, initiating reset");
+        
+        // ADCをリセット
+        int err = reset_adc_sequence(data->dev);
+        if (err < 0) {
+            LOG_ERR("Watchdog reset failed (%d)", err);
+        }
+    }
+}
+
+static void sampling_work_handler(struct k_work *work);
+static void sampling_timer_handler(struct k_timer *timer) {
+    struct analog_input_data *data = CONTAINER_OF(timer, struct analog_input_data, sampling_timer);
+    // LOG_DBG("sampling timer triggered");
+    k_work_submit_to_queue(&analog_input_work_q, &data->sampling_work);
+    k_work_submit(&data->sampling_work);
+}
+
+static int active_set_value(const struct device *dev, bool active) {
+    struct analog_input_data *data = dev->data;
+    if (data->actived == active) return 0;
+    LOG_DBG("%d", active ? 1 : 0);
+    data->actived = active;
+    return 0;
+}
+
+static int sample_hz_set_value(const struct device *dev, uint32_t hz) {
+    struct analog_input_data *data = dev->data;
+
+    if (unlikely(!data->ready)) {
+        LOG_DBG("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    if (data->enabled) {
+        LOG_DBG("Device is busy, would not update sampleing rate in enable state.");
+        return -EBUSY;
+    }
+
+    LOG_DBG("%d", hz);
+    data->sampling_hz = hz;
+    return 0;
+}
+
+static int enable_set_value(const struct device *dev, bool enable) {
+    struct analog_input_data *data = dev->data;
+    // const struct tb6612fng_config *config = dev->config;
+
+    if (unlikely(!data->ready)) {
+        LOG_DBG("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    if (data->enabled == enable) {
+        return 0;
+    }
+    
+    LOG_DBG("%d", enable ? 1 : 0);
+    if (enable) {
+        if (data->sampling_hz != 0) {
+            uint32_t usec = 1000000UL / data->sampling_hz;
+            k_timer_start(&data->sampling_timer, K_USEC(usec), K_USEC(usec));
+        } else {
+            k_timer_start(&data->sampling_timer, K_NO_WAIT, K_NO_WAIT);
+        }
+        data->enabled = true;
+    }
+    else {
+        k_timer_stop(&data->sampling_timer);
+        data->enabled = false;
+    }
+
+    return 0;
+}
+
 static void analog_input_async_init(struct k_work *work) {
-    struct analog_input_data *data = CONTAINER_OF(work, struct analog_input_data, init_work);
+    struct k_work_delayable *work_delayable = (struct k_work_delayable *)work;
+    struct analog_input_data *data = CONTAINER_OF(work_delayable, 
+                                                  struct analog_input_data, init_work);
     const struct device *dev = data->dev;
     const struct analog_input_config *config = dev->config;
-    
-    LOG_INF("Initializing analog input driver");
-    
-    /* Allocate memory for ADC buffer */
-    data->as_buff = k_malloc(config->io_channels_len * sizeof(uint16_t));
-    if (!data->as_buff) {
-        LOG_ERR("Failed to allocate memory for ADC buffer");
-        return;
-    }
-    
-    data->delta = k_malloc(config->io_channels_len * sizeof(int32_t));
-    if (!data->delta) {
-        LOG_ERR("Failed to allocate memory for delta buffer");
-        k_free(data->as_buff);
-        return;
-    }
-    
-    data->prev = k_malloc(config->io_channels_len * sizeof(int32_t));
-    if (!data->prev) {
-        LOG_ERR("Failed to allocate memory for prev buffer");
-        k_free(data->as_buff);
-        k_free(data->delta);
-        return;
-    }
-    
-    /* Configure ADC sequence */
-    struct adc_sequence *as = &data->as;
-    memset(as, 0, sizeof(*as));
-    
-    if (config->mode == ANALOG_INPUT_MODE_SCAN) {
-        /* Scan mode configuration */
-        LOG_INF("Configuring ADC in scan mode");
-        
-        as->channels = 0;
-        for (uint8_t i = 0; i < config->scan_sequence_len; i++) {
-            as->channels |= BIT(config->scan_sequence[i]);
-        }
-        
-        as->buffer = data->as_buff;
-        as->buffer_size = config->scan_sequence_len * sizeof(data->as_buff[0]);
-        as->oversampling = 0; /* nRF52840 does not support oversampling in scan mode */
-        as->calibrate = 0;
-        
-        /* Set scan sequence options */
-        as->options = (struct adc_sequence_options) {
-            .scan_sequence = config->scan_sequence,
-            .scan_length = config->scan_sequence_len,
-        };
-    } else {
-        /* Single channel mode */
-        LOG_INF("Configuring ADC in single channel mode");
-        
-        as->channels = BIT(config->io_channels[0].adc_channel.channel_id);
-        as->buffer = &data->as_buff[0];
-        as->buffer_size = sizeof(data->as_buff[0]);
-        as->oversampling = 0;
-        as->calibrate = 0;
-    }
-    
-    /* Initialize all channels */
+
+    // LOG_DBG("ANALOG_INPUT async init");
     uint32_t ch_mask = 0;
+
     for (uint8_t i = 0; i < config->io_channels_len; i++) {
-        const struct analog_input_io_channel *ch_cfg = &config->io_channels[i];
-        const struct device *adc = ch_cfg->adc_channel.dev;
-        
-        if (!device_is_ready(adc)) {
-            LOG_ERR("ADC device %s is not ready", adc->name);
-            continue;
-        }
+        struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
+        const struct device* adc = ch_cfg.adc_channel.dev;
+        uint8_t channel_id = ch_cfg.adc_channel.channel_id;
         
         struct adc_channel_cfg channel_cfg = {
             .gain = ADC_GAIN_1_6,
             .reference = ADC_REF_INTERNAL,
             .acquisition_time = ADC_ACQ_TIME_DEFAULT,
-            .channel_id = ch_cfg->adc_channel.channel_id,
-            .input_positive = ch_cfg->adc_channel.input_positive,
+            .channel_id = channel_id,
+            #ifdef CONFIG_ADC_CONFIGURABLE_INPUTS
+                #ifdef CONFIG_ADC_NRFX_SAADC
+                    .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0 + channel_id,
+                #else /* CONFIG_ADC_NRFX_SAADC */
+                    .input_positive = channel_id,
+                #endif /* CONFIG_ADC_NRFX_SAADC */
+            #endif /* CONFIG_ADC_CONFIGURABLE_INPUTS */
         };
-        
-        ch_mask |= BIT(ch_cfg->adc_channel.channel_id);
-        
+
+        ch_mask |= BIT(channel_id);
+
+        if (!device_is_ready(adc)) {
+            LOG_ERR("AIN%u device is not ready %s", i, adc->name);
+            continue;
+        }
+
         int err = adc_channel_setup(adc, &channel_cfg);
         if (err < 0) {
-            LOG_ERR("Failed to setup ADC channel %d: %d", ch_cfg->adc_channel.channel_id, err);
+            LOG_ERR("AIN%u setup returned %d", i, err);
         }
-        
-        /* Initialize channel state */
-        data->delta[i] = 0;
-        data->prev[i] = 0;
     }
-    
-    /* Initialize sampling timer */
-    k_timer_init(&data->sampling_timer, sampling_timer_handler, NULL);
-    k_work_init_delayable(&data->init_work, analog_input_async_init);
-    k_work_init(&data->sampling_work, sampling_work_handler);
-    
-    /* Start sampling timer */
-    data->enabled = true;
-    k_timer_start(&data->sampling_timer, K_MSEC(1000 / config->sampling_hz), 
-                  K_MSEC(1000 / config->sampling_hz));
-    
-    LOG_INF("Analog input driver initialized successfully");
+
+    uint16_t delta_size = config->io_channels_len * sizeof(int32_t);
+    data->delta = malloc(delta_size);
+    memset(data->delta, 0, delta_size);
+
+    uint16_t prev_size = config->io_channels_len * sizeof(int32_t);
+    data->prev = malloc(prev_size);
+    memset(data->prev, 0, prev_size);
+
+    uint16_t buff_size = config->io_channels_len * sizeof(uint16_t);
+    data->as_buff = malloc(buff_size);
+    memset(data->as_buff, 0, buff_size);
+
+    data->as = (struct adc_sequence){
+        .channels = ch_mask,
+        .buffer = data->as_buff,
+        .buffer_size = buff_size,
+        .oversampling = 0,
+        .resolution = 12,
+        .calibrate = true,
+    };
+
+#ifdef CONFIG_ADC_ASYNC
+    k_poll_signal_init(&data->async_sig);
+    struct k_poll_event async_evt = K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SIGNAL,
+                                                             K_POLL_MODE_NOTIFY_ONLY,
+                                                             &data->async_sig);
+    data->async_evt = async_evt;
+#endif
+
     data->ready = true;
+
+    k_work_init(&data->sampling_work, sampling_work_handler);
+    k_work_queue_start(&analog_input_work_q,
+                        analog_input_q_stack, K_THREAD_STACK_SIZEOF(analog_input_q_stack),
+                        CONFIG_ANALOG_INPUT_WORKQUEUE_PRIORITY, NULL);
+
+    k_timer_init(&data->sampling_timer, sampling_timer_handler, NULL);
+
+    sample_hz_set_value(dev, config->sampling_hz);
+    active_set_value(dev, true);
+    if (data->sampling_hz) {
+        enable_set_value(dev, true);
+    }
+
 }
 
-/**
- * @brief Process raw ADC data for a single channel
- */
-static void process_channel_data(const struct device *dev, uint8_t ch_idx, int32_t raw) {
-    struct analog_input_data *data = dev->data;
-    const struct analog_input_config *config = dev->config;
-    const struct analog_input_io_channel *ch_cfg = &config->io_channels[ch_idx];
-    
-    int32_t mv = raw;
-    adc_raw_to_millivolts(adc_ref_internal(ch_cfg->adc_channel.dev), 
-                         ADC_GAIN_1_6, data->as.resolution, &mv);
-    
-    /* Apply midpoint offset */
-    int32_t v = mv - ch_cfg->mv_mid;
-    
-    /* Apply deadzone */
-    if (abs(v) < ch_cfg->mv_deadzone) {
-        v = 0;
-    }
-    
-    /* Apply min/max limits */
-    if (v > ch_cfg->mv_min_max) {
-        v = ch_cfg->mv_min_max;
-    } else if (v < -ch_cfg->mv_min_max) {
-        v = -ch_cfg->mv_min_max;
-    }
-    
-    /* Apply scaling */
-    if (ch_cfg->scale_divisor > 0) {
-        v = (v * ch_cfg->scale_multiplier) / ch_cfg->scale_divisor;
-    }
-    
-    /* Apply inversion */
-    if (ch_cfg->invert) {
-        v = -v;
-    }
-    
-    /* Update delta and report */
-    if (ch_cfg->report_on_change_only) {
-        data->delta[ch_idx] = v;
-    } else {
-        data->delta[ch_idx] += v;
-    }
-    
-    if (IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)) {
-        LOG_DBG("Channel %d: raw=%d, mv=%d, processed=%d", 
-               ch_idx, raw, mv, data->delta[ch_idx]);
-    }
-}
 
-/**
- * @brief Report processed ADC data to the input subsystem
- */
-static int analog_input_report_data(const struct device *dev) {
-    struct analog_input_data *data = dev->data;
-    const struct analog_input_config *config = dev->config;
-    
-    if (!data->ready || !data->enabled) {
-        return 0;
-    }
-    
-    int err = 0;
-    
-    if (config->mode == ANALOG_INPUT_MODE_SCAN) {
-        /* Scan mode: read all channels in one go */
-        err = adc_read(config->io_channels[0].adc_channel.dev, &data->as);
-        if (err < 0) {
-            LOG_ERR("ADC scan read failed: %d", err);
-            return err;
-        }
-        
-        /* Process scan results */
-        for (uint8_t i = 0; i < config->scan_sequence_len; i++) {
-            uint8_t channel_id = config->scan_sequence[i];
-            
-            /* Find corresponding channel configuration index */
-            uint8_t ch_idx = UINT8_MAX;
-            for (uint8_t j = 0; j < config->io_channels_len; j++) {
-                if (config->io_channels[j].adc_channel.channel_id == channel_id) {
-                    ch_idx = j;
-                    break;
-                }
-            }
-            
-            if (ch_idx != UINT8_MAX) {
-                /* Process this channel's data */
-                process_channel_data(dev, ch_idx, data->as_buff[i]);
-            }
-        }
-    } else {
-        /* Single channel mode */
-        for (uint8_t i = 0; i < config->io_channels_len; i++) {
-            const struct analog_input_io_channel *ch_cfg = &config->io_channels[i];
-            const struct device *adc = ch_cfg->adc_channel.dev;
-            
-            if (i == 0) {
-                /* First read, use configured sequence */
-                err = adc_read(adc, &data->as);
-            } else {
-                /* Subsequent reads, update channel configuration */
-                data->as.channels = BIT(ch_cfg->adc_channel.channel_id);
-                data->as.buffer = &data->as_buff[i];
-                data->as.buffer_size = sizeof(data->as_buff[i]);
-                err = adc_read(adc, &data->as);
-            }
-            
-            if (err < 0) {
-                LOG_ERR("Failed to read ADC channel %d: %d", i, err);
-                continue;
-            }
-            
-            /* Process this channel's data */
-            process_channel_data(dev, i, data->as_buff[i]);
-        }
-    }
-    
-    /* Report processed data */
-    for (uint8_t i = 0; i < config->io_channels_len; i++) {
-        const struct analog_input_io_channel *ch_cfg = &config->io_channels[i];
-        int32_t dv = data->delta[i];
-        
-        if (dv != 0) {
-            if (ch_cfg->report_on_change_only) {
-                /* Report only when value changes */
-                if (dv != data->prev[i]) {
-                    input_report(dev, ch_cfg->evt_type, ch_cfg->input_code, dv, true, K_NO_WAIT);
-                    data->prev[i] = dv;
-                    
-                    if (IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_REPORT)) {
-                        LOG_DBG("Reporting channel %d: value=%d", i, dv);
-                    }
-                }
-            } else {
-                /* Accumulative reporting */
-                input_report(dev, ch_cfg->evt_type, ch_cfg->input_code, dv, true, K_NO_WAIT);
-                data->delta[i] = 0;
-                
-                if (IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_REPORT)) {
-                    LOG_DBG("Reporting channel %d: delta=%d", i, dv);
-                }
-            }
-        }
-    }
-    
-    return 0;
-}
 
-/**
- * @brief Sampling timer handler
- */
-static void sampling_timer_handler(struct k_timer *timer) {
-    struct analog_input_data *data = CONTAINER_OF(timer, struct analog_input_data, sampling_timer);
-    k_work_submit(&data->sampling_work);
-}
 
-/**
- * @brief Sampling work handler
- */
-static void sampling_work_handler(struct k_work *work) {
-    struct analog_input_data *data = CONTAINER_OF(work, struct analog_input_data, sampling_work);
-    const struct device *dev = data->dev;
-    
-    analog_input_report_data(dev);
-}
-
-/**
- * @brief Driver initialization function
- */
 static int analog_input_init(const struct device *dev) {
     struct analog_input_data *data = dev->data;
+    // const struct analog_input_config *config = dev->config;
+    int err = 0;
+
     data->dev = dev;
+    k_work_init_delayable(&data->init_work, analog_input_async_init);
+    k_work_schedule(&data->init_work, K_MSEC(1));
+
+    // Watchdog work itemを初期化
+    k_work_init_delayable(&data->watchdog_work, watchdog_work_handler);
     
-    /* Schedule asynchronous initialization */
-    k_work_submit(&data->init_work);
+    // Watchdogタイマーを開始
+    k_work_schedule(&data->watchdog_work, K_MSEC(CONFIG_ANALOG_INPUT_WATCHDOG_TIMEOUT_MS));
     
+    return 0;
+//    return err;
+}
+
+static int analog_input_attr_set(const struct device *dev, enum sensor_channel chan,
+                            enum sensor_attribute attr, const struct sensor_value *val) {
+    struct analog_input_data *data = dev->data;
+    // const struct analog_input_config *config = dev->config;
+    int err;
+
+    if (chan != SENSOR_CHAN_ALL) {
+        LOG_DBG("Selected channel is not supported: %d.", chan);
+        return -ENOTSUP;
+    }
+    if (unlikely(!data->ready)) {
+        LOG_DBG("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    switch ((uint32_t)attr) {
+    case ANALOG_INPUT_ATTR_SAMPLING_HZ:
+        err = sample_hz_set_value(dev, ANALOG_INPUT_SVALUE_TO_SAMPLING_HZ(*val));
+        break;
+
+    case ANALOG_INPUT_ATTR_ENABLE:
+        err = enable_set_value(dev, ANALOG_INPUT_SVALUE_TO_ENABLE(*val));
+        break;
+
+    case ANALOG_INPUT_ATTR_ACTIVE:
+        err = active_set_value(dev, ANALOG_INPUT_SVALUE_TO_ACTIVE(*val));
+        break;
+
+    default:
+        LOG_ERR("Unknown attribute");
+        err = -ENOTSUP;
+    }
+
+    return err;
+}
+
+static int analog_input_sample_fetch(const struct device *dev, enum sensor_channel chan) {
+    struct analog_input_data *data = dev->data;
+    // const struct analog_input_config *config = dev->config;
+
+    if (chan != SENSOR_CHAN_ALL) {
+        LOG_DBG("Selected channel is not supported: %d.", chan);
+        return -ENOTSUP;
+    }
+    if (unlikely(!data->ready)) {
+        LOG_DBG("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    int err = analog_input_report_data(data->dev);
+    if (err < 0) {
+        LOG_ERR("analog_input_report_data returned %d", err);
+        return err;
+    }
+
     return 0;
 }
 
-/* Driver registration */
-static struct analog_input_data analog_input_data;
+static int analog_input_channel_get(const struct device *dev, enum sensor_channel chan,
+                                    struct sensor_value *val) {
+    struct analog_input_data *data = dev->data;
+    const struct analog_input_config *config = dev->config;
 
-DEVICE_DT_INST_DEFINE(0, analog_input_init, NULL,
-                      &analog_input_data,
-                      DEVICE_DT_INST_GET(0)->config,
-                      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE,
-                      NULL);
+    if (unlikely(chan != SENSOR_CHAN_ALL)) {
+        LOG_DBG("Selected channel is not supported: %d.", chan);
+        return -ENOTSUP;
+    }
+    if (unlikely(!data->ready)) {
+        LOG_DBG("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    for (uint8_t i = 0; i < config->io_channels_len; i++) {
+        struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
+        if (!ch_cfg.report_on_change_only) {
+            continue;
+        }
+        if (i == 0)      val->val1 = data->delta[i];
+        else if (i == 1) val->val2 = data->delta[i];
+    }
+
+    return 0;
+}
+
+
+// analog_input.c に追加
+static int reset_adc_sequence(const struct device *dev);
+static int reset_adc_sequence(const struct device *dev) {
+    struct analog_input_data *data = dev->data;
+    const struct analog_input_config *config = dev->config;
+
+    LOG_DBG("Resetting ADC sequence");
+
+    // ADCの設定をリセット
+    for (uint8_t i = 0; i < config->io_channels_len; i++) {
+        struct analog_input_io_channel ch_cfg = config->io_channels[i];
+        const struct device* adc = ch_cfg.adc_channel.dev;
+        
+        if (!device_is_ready(adc)) {
+            LOG_ERR("ADC device not ready");
+            return -ENODEV;
+        }
+
+        // ADCチャンネルを再設定
+        struct adc_channel_cfg channel_cfg = {
+            .gain = ADC_GAIN_1_6,
+            .reference = ADC_REF_INTERNAL,
+            .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+            .channel_id = ch_cfg.adc_channel.channel_id,
+            #ifdef CONFIG_ADC_CONFIGURABLE_INPUTS
+                #ifdef CONFIG_ADC_NRFX_SAADC
+                    .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0 + ch_cfg.adc_channel.channel_id,
+                #else
+                    .input_positive = ch_cfg.adc_channel.channel_id,
+                #endif
+            #endif
+        };
+
+        int err = adc_channel_setup(adc, &channel_cfg);
+        if (err < 0) {
+            LOG_ERR("Failed to setup channel #%d (%d)", i, err);
+            return err;
+        }
+    }
+
+    // ADCシーケンスを再初期化
+    data->as.oversampling = 0; // nRF52840の既知の問題に対する対応
+    data->as.calibrate = true;
+
+    return 0;
+}
+
+static const struct sensor_driver_api analog_input_driver_api = {
+    .attr_set = analog_input_attr_set,
+    .sample_fetch = analog_input_sample_fetch,
+    .channel_get = analog_input_channel_get,
+};
+
+#define TRANSFORMED_IO_CHANNEL_ENTRY(node_id)                                                      \
+    {                                                                                              \
+        .adc_channel = ADC_DT_SPEC_GET_BY_IDX(node_id, 0),                                         \
+        .mv_mid = DT_PROP(node_id, mv_mid),                                                        \
+        .mv_min_max = DT_PROP(node_id, mv_min_max),                                                \
+        .mv_deadzone = DT_PROP(node_id, mv_deadzone),                                              \
+        .invert = DT_PROP(node_id, invert),                                                        \
+        .report_on_change_only = DT_PROP(node_id, report_on_change_only),                          \
+        .scale_multiplier = DT_PROP(node_id, scale_multiplier),                                    \
+        .scale_divisor = DT_PROP(node_id, scale_divisor),                                          \
+        .evt_type = DT_PROP(node_id, evt_type),                                                    \
+        .input_code = DT_PROP(node_id, input_code),                                                \
+    }
+
+#define ANIN_IOC_CHILD_LEN_PLUS_ONE(node) 1 +
+
+#define ANALOG_INPUT_DEFINE(n)                                                                     \
+    static struct analog_input_data data##n = {                                                    \
+    };                                                                                             \
+    static const struct analog_input_config config##n = {                                          \
+        .sampling_hz = DT_PROP(DT_DRV_INST(n), sampling_hz),                                       \
+        .io_channels_len = (DT_FOREACH_CHILD(DT_DRV_INST(n), ANIN_IOC_CHILD_LEN_PLUS_ONE) 0),      \
+        .io_channels = { DT_INST_FOREACH_CHILD_SEP(n, TRANSFORMED_IO_CHANNEL_ENTRY, (, )) },       \
+    };                                                                                             \
+                                                                                                   \
+    DEVICE_DT_INST_DEFINE(n, analog_input_init, NULL, &data##n, &config##n, POST_KERNEL,           \
+                          CONFIG_SENSOR_INIT_PRIORITY, &analog_input_driver_api);
+
+DT_INST_FOREACH_STATUS_OKAY(ANALOG_INPUT_DEFINE)
